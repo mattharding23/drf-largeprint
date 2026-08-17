@@ -38,8 +38,17 @@ ML_LINE_RE = re.compile(rf"^\s{{0,4}}({_ML})\s{{0,4}}(\$[\d,]+)?\s{{2,}}\S|^\s{{
 # two cells' text runs together) - e.g. "28 - 1 Equilibrate" is post #2 + ML
 # "8-1" + name, not post #28. HORSE_START_RE can't tell these apart from a
 # plain name line, so this is tried as a fallback in parse_horse.
+# Name charset matches HORSE_START_RE's (parens included, for foreign-bred
+# suffixes like "(Ire)"/"(GB)") - a mismatch here previously made this regex
+# silently fail on any foreign-bred horse whose post+ML+name all ran
+# together with no gap (e.g. "27-2 Not Ever (Ire)"), which meant
+# split_horse_blocks couldn't find this horse's own start line at all and
+# fell back to starting its block at the "Own:" line - merging its
+# identity/breeding data into the PRECEDING horse's block instead (see the
+# 2026-08-17 bug report: this showed up as a phantom "#None -" entry with
+# mismatched jockey/trainer/breeding data one horse late).
 COMBINED_START_RE = re.compile(
-    rf"^\s{{0,4}}(\d{{1,2}}?)({_ML})\s+([A-Z][A-Za-z\u2019\'\.\- ]+?)\s*$"
+    rf"^\s{{0,4}}(\d{{1,2}}?)({_ML})\s+([A-Z][A-Za-z\u2019\'\.\-\(\) ]+?)\s*$"
 )
 # This fixture's export never actually prints the word "SCRATCHED" on a
 # scratched horse's entry (checked directly - L'Eclair, race 10, is the

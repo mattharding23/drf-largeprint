@@ -123,25 +123,40 @@ def _parse_domestic_pp_line(line: str) -> dict | None:
     # Weight lines have no claiming price/conditions to encode: "Md Sp Wt
     # 111k" with no marker at all - see the 2026-08-17 bug report). The
     # time field's end position is a reliable anchor regardless.
+    # `fig` allows an optional leading "-" to catch DRF's "-0" placeholder
+    # for an eased/no-figure effort (seen: Sports Hero, race 5) - without
+    # it, "-0" doesn't look like a number to this pattern, so the lazy
+    # `type` group swallows right past it and grabs the NEXT number in the
+    # line instead - the running line's own start-call position - as if it
+    # were the speed figure (see the 2026-08-17 bug report).
     search_area = rest[time_m.end():] if time_m else rest
-    type_m = re.search(r"(?P<type>[A-Z][\w \$/'\-]{2,40}?)\s+(?P<fig>\d{1,3})\s", search_area)
+    type_m = re.search(r"(?P<type>[A-Z][\w \$/'\-]{2,40}?)\s+(?P<fig>-?\d{1,3})\s", search_area)
     race_type = type_m.group("type").strip() if type_m else None
     fig = type_m.group("fig") if type_m else None
+    if fig == "-0":
+        fig = None
 
     # Finish: "/N" gives field size, immediately followed by the running
     # position at each point of call (start, 1st call, 2nd call, stretch,
     # finish) - a chain of "position+margin-glyph" tokens, e.g. "1\u00c7 1\u00c7 6\u00ab
-    # 7\u00a6\u00ae\u00f5", EXCEPT the very first one (the start-call position) which has
-    # no margin glyph at all. The final call token's leading number gives
-    # the finish position.
+    # 7\u00a6\u00ae\u00f5". This module previously assumed the very first call (the
+    # start-call position) never carries a margin glyph, requiring a bare
+    # digit there - true on some lines (a horse eased/pulled up: "4 10\u00aa
+    # 10\u00ac\u00f4...") but false on most normal running lines, where every call
+    # including the start position carries its own glyph (e.g. "7\u00ab\u00f5
+    # 7\u00aa\u00f6 7\u00a9\u00f6 3\u00f4 1\u00a7\u00f5" - no bare digit anywhere) - see the 2026-08-17
+    # bug report, where this left Finish blank on nearly every domestic PP
+    # line. `{0,3}` (rather than requiring 1-3 glyph chars) makes the
+    # margin-glyph suffix optional per call, covering both shapes with one
+    # pattern instead of needing a separate bare-first-call case.
     field_size = None
     fs_m = re.search(r"/(\d{1,2})", rest)
     if fs_m:
         field_size = fs_m.group(1)
     finish_pos = None
-    calls_m = re.search(r"/\d{1,2}\s+\d{1,2}\s+((?:\d{1,2}[\u00a1-\uffff]{1,3}\s*){1,6})", rest)
+    calls_m = re.search(r"/\d{1,2}\s+((?:\d{1,2}[\u00a1-\uffff]{0,3}\s*){1,6})", rest)
     if calls_m:
-        calls = re.findall(r"(\d{1,2})[\u00a1-\uffff]{1,3}", calls_m.group(1))
+        calls = re.findall(r"(\d{1,2})[\u00a1-\uffff]{0,3}", calls_m.group(1))
         if calls:
             finish_pos = calls[-1]
 
@@ -225,10 +240,26 @@ def parse_pp_lines(horse_block_lines: list[str], max_lines: int = 5) -> tuple[li
     horse_entry.py), returns (pp_dicts, parse_warnings). Only the first
     `max_lines` successfully-parsed PP rows are kept, most-recent-first
     (which is already the source order).
+
+    Stops scanning once a "WORKS:" line is reached, rather than scanning
+    the whole block. A WORKS: entry uses the exact same bare
+    "day+month-glyph+2-digit-year" date code as a foreign PP line (no
+    trailing "="), so without this cutoff a horse whose WORKS: list wraps
+    onto a second physical line - common on 2yo/debut horses with many
+    workouts, where that wrapped continuation line has no "WORKS:" prefix
+    of its own to filter on - gets a fabricated "foreign race" appended
+    from its own workout data (see the 2026-08-17 bug report: this hit
+    first-time starters hardest, since a real first-time starter has zero
+    genuine PP lines to hit `max_lines` before reaching WORKS: otherwise).
     """
     results = []
     warnings = []
-    for line in horse_block_lines:
+    works_idx = next(
+        (i for i, l in enumerate(horse_block_lines) if l.strip().startswith("WORKS:")),
+        None,
+    )
+    scan_lines = horse_block_lines[:works_idx] if works_idx is not None else horse_block_lines
+    for line in scan_lines:
         if len(results) >= max_lines:
             break
         stripped = line.strip()
