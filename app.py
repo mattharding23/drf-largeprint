@@ -17,7 +17,7 @@ from pathlib import Path
 import streamlit as st
 
 from parser.extract import extract_layout_text, ExtractionError
-from parser.race_header import parse_race_header, RACE_NUM_TRACK_RE
+from parser.race_header import parse_race_header, find_race_block_starts
 from parser.horse_entry import split_horse_blocks, parse_horse
 from parser.stat_grid import extract_stat_rows
 from generator.build_pdf import build_pdf
@@ -117,18 +117,12 @@ def parse_card(pdf_path: str) -> tuple[dict | None, list[str], list[str]]:
         return None, warnings, [str(exc)]
 
     lines = text.split("\n")
-    race_start_idxs = [
-        i for i, l in enumerate(lines)
-        if RACE_NUM_TRACK_RE.match(l) and re.search(r"[A-Za-z]{3,}", l)
-    ]
-    # De-dupe / filter: real race-header lines are followed reasonably soon
-    # by a "Post time:" line; index-page "N  Name" listings never are.
-    confirmed = []
-    for idx in race_start_idxs:
-        window = "\n".join(lines[idx: idx + 40])
-        if "Post time:" in window:
-            confirmed.append(idx)
-    race_start_idxs = confirmed
+    # find_race_block_starts anchors on the race header's unambiguous
+    # "Saratoga ... Furlongs/Miles ... Purse $NNN" text rather than "digit
+    # + capitalized word" (which a horse's own post-number + name line also
+    # matches - see the 2026-08-17 bug report on why the old approach here
+    # silently dropped 9 of 10 races and mislabeled the 10th).
+    race_start_idxs = find_race_block_starts(text)
 
     if not race_start_idxs:
         return None, warnings, [
@@ -137,11 +131,6 @@ def parse_card(pdf_path: str) -> tuple[dict | None, list[str], list[str]]:
             "changed enough that the header pattern this app looks for "
             "no longer matches."
         ]
-
-    track_name = None
-    m = RACE_NUM_TRACK_RE.match(lines[race_start_idxs[0]])
-    if m:
-        track_name = m.group(2).strip()
 
     date_m = re.search(r"Saratoga\s*\((\d{1,2})/(\d{1,2})/(\d{4})\)", text)
     date_str = None
@@ -214,6 +203,7 @@ def parse_card(pdf_path: str) -> tuple[dict | None, list[str], list[str]]:
             "fixture that the horse-block detection regex needs adjusting."
         ]
 
+    track_name = next((r.get("track_name") for r in races if r.get("track_name")), None)
     card = {
         "track_name": track_name or "Track",
         "date_str": date_str or "",

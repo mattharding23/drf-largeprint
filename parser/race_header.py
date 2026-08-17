@@ -37,11 +37,119 @@ RACE_NUM_TRACK_RE = re.compile(
 # The turf marker is "(Turf)" on its own but "(Inner Turf)" or similar on
 # card-specific turf courses - matched by "ends with Turf)" rather than an
 # exact literal.
+# Originally required the race-type text to end in a period immediately
+# before "Purse $" - true for stakes headers (race 9 in the 2026-08-16
+# fixture: "...(Turf). (:59\u2074) Mahony-G3 THE MAHONY. Grade III. Purse
+# $225,000...", where a period genuinely does sit right before "Purse $").
+# False for ordinary-race headers (races 1, 10, etc. in that same fixture:
+# "...MILES (1:46\u00a8) \u00d0Alw 105000N1X Purse $105,000 For Three Year
+# Olds And Upward...Two Races. Three Year Olds, 121 lbs...."), where "Purse
+# $" comes immediately after the bare race-class code and the conditions
+# paragraph's own first period doesn't appear until much later - see the
+# 2026-08-17 bug report. `(?:\([^)]*\)\s*)*` skips over the par-time /
+# grade parenthetical(s) that sit between the distance and the race-class
+# code (e.g. "(1:46\u00a8)") without requiring a trailing period on either
+# side of them; race_type is then just "whatever comes next, up to Purse
+# $" - lazy and unanchored on punctuation, so it works for both formats.
 DISTANCE_LINE_RE = re.compile(
-    r"(?P<distance>[\d\u00a1-\uffff/ ]+(?i:Furlongs?|Miles?))\s*(?P<turf>\([A-Za-z ]*Turf\))?"
-    r".*?(?P<race_type>[A-Z][A-Za-z /]+)\.\s*Purse\s*\$(?P<purse>[\d,]+)"
+    r"(?P<distance>[\d\u00a1-\uffff/ ]+(?i:Furlongs?|Miles?))\s*"
+    r"(?P<turf>\([A-Za-z ]*Turf\))?\.?\s*"
+    r"(?:\([^)]*\)\s*)*"
+    r"(?P<race_type>[^\n]*?)\s*"
+    r"Purse\s*\$(?P<purse>[\d,]+)",
+    re.IGNORECASE,
 )
 POST_TIME_RE = re.compile(r"Post time:\s*([\d:]+\s*[AP]?M?\s*ET)")
+
+# A race number that sits completely alone on its own line, with the track
+# name/distance starting on a LATER line rather than the same one - see
+# HEADER_ANCHOR_RE's docstring below for why this format needs its own
+# detection path.
+STANDALONE_RACE_NUM_RE = re.compile(r"^\s*(\d{1,2})\s*$")
+# Recovers the track name independently of the race-number line, for the
+# same split-line format - matches the word right before the distance
+# ("Saratoga" in "Saratoga 6\u00f4 Furlongs...").
+TRACK_NAME_RE = re.compile(
+    r"([A-Z][A-Za-z]+)\s+[\d\u00a1-\uffff/ .]+(?:Furlongs?|MILES?|Miles?)\b",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Race-boundary detection (used by app.py to slice the whole document into
+# per-race chunks BEFORE calling parse_race_header on each one)
+# ---------------------------------------------------------------------------
+# Previously, app.py found race starts by scanning for RACE_NUM_TRACK_RE
+# matches directly - i.e. "race number + track name on one line" - the same
+# assumption this module's own num/track lookup below made. That format
+# does NOT hold on every DRF export: the 2026-08-16 Saratoga card (see the
+# 2026-08-17 bug report this whole block traces back to) always prints the
+# race number alone on its own line, with "Saratoga <dist> ...
+# Furlongs/Miles ... Purse $..." starting a few lines later - never on the
+# same line. Because RACE_NUM_TRACK_RE never matched a genuine race header
+# on that fixture, app.py's old boundary-detection loop fell through to
+# matching the only other thing with a similar "digit + capitalized word"
+# shape in the document: a horse's own post-number + name line (e.g.
+# " 7  Stradale", a horse entered in race 9) - producing a false-positive
+# race start that silently dropped every race before it and mislabeled the
+# one race it did produce.
+#
+# HEADER_ANCHOR_RE fixes this by anchoring on the race header's only truly
+# unambiguous content instead: the "Saratoga ... Furlongs/Miles ... Purse
+# $NNN" text itself, which never appears inside a horse's own block.
+# `.{0,400}?` bridges the wrapped conditions-paragraph lines between the
+# distance and the purse figure - 400 chars comfortably covers the longest
+# conditions paragraph seen in this fixture while stopping well short of
+# the (much larger) gap to a neighboring race's own header.
+HEADER_ANCHOR_RE = re.compile(
+    r"Saratoga\s+[\d\u00a1-\uffff/ .]+(?:Furlongs?|MILES?|Miles?)\b.{0,400}?Purse\s*\$[\d,]+",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def find_race_block_starts(full_text: str) -> list[int]:
+    """
+    Returns the line indices where each race's block should start, scanning
+    the WHOLE document text at once (never per-page - see extract.py's
+    docstring on why a race's header can print on the page before its
+    horses do). For each HEADER_ANCHOR_RE match, looks up to 5 lines
+    backward for the race-number line - either combined with the track
+    name on one line (RACE_NUM_TRACK_RE, the format this app was originally
+    built against) or standing alone on its own line
+    (STANDALONE_RACE_NUM_RE, this fixture's format) - so a race block
+    starts at the NUMBER, not at the anchor text itself. Falls back to the
+    anchor's own line if neither is found nearby, so a race block still
+    gets created (parse_race_header will warn about the missing number
+    rather than the race silently vanishing).
+    """
+    import bisect
+
+    lines = full_text.split("\n")
+    offsets = []
+    pos = 0
+    for l in lines:
+        offsets.append(pos)
+        pos += len(l) + 1
+
+    starts = []
+    for m in HEADER_ANCHOR_RE.finditer(full_text):
+        anchor_idx = bisect.bisect_right(offsets, m.start()) - 1
+        found = None
+        for back in range(0, 6):
+            i = anchor_idx - back
+            if i < 0:
+                break
+            if STANDALONE_RACE_NUM_RE.match(lines[i]) or RACE_NUM_TRACK_RE.match(lines[i]):
+                found = i
+                break
+        starts.append(found if found is not None else anchor_idx)
+
+    seen = set()
+    ordered = []
+    for s in sorted(starts):
+        if s not in seen:
+            seen.add(s)
+            ordered.append(s)
+    return ordered
 
 # Conditions text can run across a couple of wrapped lines before "Post
 # time:" - captured separately so it can be condensed into the compact
@@ -87,12 +195,27 @@ def parse_race_header(race_block_text: str) -> tuple[dict, list[str]]:
 
     race_num = None
     track_name = None
-    for line in lines[:5]:
+    for line in lines[:6]:
         m = RACE_NUM_TRACK_RE.match(line)
         if m:
             race_num = int(m.group(1))
             track_name = m.group(2).strip()
             break
+
+    if race_num is None:
+        # Split-line format (race number alone, track name a few lines
+        # later with the distance) - see HEADER_ANCHOR_RE's docstring
+        # above. Recovered independently since neither piece reliably sits
+        # next to the other in this layout.
+        for line in lines[:6]:
+            m = STANDALONE_RACE_NUM_RE.match(line)
+            if m:
+                race_num = int(m.group(1))
+                break
+        tm = TRACK_NAME_RE.search(race_block_text)
+        if tm:
+            track_name = tm.group(1).strip()
+
     if race_num is None:
         warnings.append("Could not find race number/track line for this race block.")
 
@@ -119,6 +242,7 @@ def parse_race_header(race_block_text: str) -> tuple[dict, list[str]]:
 
     race = {
         "num": race_num,
+        "track_name": track_name,
         "post_time": post_time,
         "distance": distance,
         "surface": surface,
